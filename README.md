@@ -26,12 +26,11 @@ kimi
 | （无） | 标准安装：装 glibc 运行时 → 跑官方安装器 → 打补丁 → 生成启动器 |
 | `--config my.toml` | 安装后把 `my.toml` 套用成 `~/.kimi-code/config.toml`（原文件备份成 `.bak`） |
 | `--no-hardlink` | 不打 `nolink` 补丁 |
-| `--no-ifaddrs` | 不打 `getifaddrs` 补丁（**`kimi web` 会崩**） |
 | `--no-official` | 不跑官方安装器，只做 glibc + 补丁 + 启动器 |
 | `--dry-run` | 只打印将要执行的命令，不真跑 |
 | `--help` | 用法 |
 
-## 为什么需要这两个补丁
+## 为什么需要这些处理
 
 ### `nolink.so` —— 硬链接
 
@@ -40,40 +39,50 @@ Android 禁止应用创建硬链接（`link()` 恒返回 `EACCES`）。而 Kimi 
 
 补丁把 `link()` 降级成 `rename()`——同样是一次原子替换，语义足够接近。
 
-### `ifaddrs.so` —— 网卡枚举
+### `hijack.js` —— 网卡枚举兜底
 
-glibc 的 `getifaddrs()` 在 Android 上必然失败（`EACCES`），原因有两个：
-
-1. 它发 NETLINK_ROUTE 的 **RTM_GETLINK** 汇总，内核要求 `CAP_NET_ADMIN`，普通应用没有；
-2. 它还要读 `/proc/net/if_inet6` 拿 IPv6，而 Android 对普通应用封了整个 `/proc/net`。
-
-Node 的 `os.networkInterfaces()` 底层就是 `getifaddrs()`，于是会抛：
+`os.networkInterfaces()` 在 Android 上可能抛异常：glibc 的 `getifaddrs()` 内部用
+NETLINK_ROUTE 做 **RTM_GETLINK** 汇总，内核要求 `CAP_NET_ADMIN`，普通 Android 应用没有；
+它还要读 `/proc/net/if_inet6`，而 Android 对普通应用封了整个 `/proc/net`。两者都会让
+Node 抛出：
 
 ```
 SystemError [ERR_SYSTEM_ERROR]: uv_interface_addresses returned Unknown system error 13
-    at Object.networkInterfaces (node:os:218:16)
-    at getAddresses (...main.cjs:379195:62)
-    at Object.logServerAddress (...main.cjs:379208:66)
 ```
 
-`kimi web` 启动 HTTP 服务后要打印服务器地址，正好走到这里，进程直接崩。
+而 `kimi web` 启动 HTTP 服务后要打印服务器地址，正好走到 `os.networkInterfaces()`，
+异常从 `listening` 事件回调里逃逸出去，**整个进程崩掉**（`listen()` 的 promise 永不
+settle，`try/catch` 也接不住）。
 
-补丁换成了 bionic 那套能用的做法：发 **RTM_GETADDR**（地址表，内核不要求
-`CAP_NET_ADMIN`）并且用 `sendto()` 而不是 `send()`/`sendmsg()`——Android 的 SELinux
-放行 `sendto`、拒绝另外两个。
+`hijack.js` 放在 `~/.kimi-code/hijack.js`，启动器通过 `NODE_OPTIONS=--require` 预加载：
 
-> 附带说明：这台机器上的内核头文件和 Termux 头文件在 `IFA_*` 编号上差 1
-> （Android 新头文件给 enum 加了 `IFA_UNSPEC`），所以补丁在运行时探测用哪套编号。
+```js
+const os = require('os');
+const real = os.networkInterfaces;
+
+os.networkInterfaces = function networkInterfaces () {
+  try {
+    return real.call(os);
+  } catch {
+    return {};
+  }
+};
+```
+
+它不替换实现，只兜住异常：枚举失败时返回空对象，进程照常启动，
+只是启动横幅里没有 `Network:` 行（`Local:` 那行照常有）。
 
 ## 安装完的自检
 
-脚本会跑一个只调 `getifaddrs()` 的小程序，对比打补丁前后的结果：
+脚本会跑 `kimi --version`，确认启动器能跑起来。
 
-```
-==> getifaddrs: 不打补丁=FAIL getifaddrs: 1 FAIL, 打补丁=OK
+想单独验证 hijack.js 的效果：
+
+```sh
+NODE_OPTIONS="--require ~/.kimi-code/hijack.js" kimi web --host 0.0.0.0
 ```
 
-`OK` 说明补丁生效，`kimi web` 能正常启动。
+能打印出 `Kimi server ready` 就说明补丁生效了（不打补丁时这条命令会直接崩）。
 
 ## 几个容易踩的坑
 
@@ -86,6 +95,8 @@ SystemError [ERR_SYSTEM_ERROR]: uv_interface_addresses returned Unknown system e
 - **PATH 里 `~/.kimi-code/bin` 要清掉**：那里是裸的 glibc 二进制，排在启动器前面的话
   `kimi` 就废了。脚本会自动清理 `.zshrc`/`.bashrc`/`.profile` 里对应的行。
 - **别删 `LD_PRELOAD` 那行**：路径悬空的话，bionic 的子进程会跟着炸。
+- **别删启动器里的 `NODE_OPTIONS` 那行**：`hijack.js` 靠它预加载，删了
+  `kimi web --host 0.0.0.0` 在 Android 上会直接崩。
 
 ## 从电脑访问手机上的 `kimi web`
 
@@ -120,6 +131,7 @@ python3 tunnel-phone.py <电脑IP>
 - Termux（Android）
 - aarch64（termux-glibc 目前只提供 aarch64）
 - 脚本需要联网：装 glibc 运行时、跑官方安装器
+- 编译硬链接补丁需要 `gcc-glibc`（脚本会自动 `pkg install`，已装则跳过）
 
 ## License
 
