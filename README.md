@@ -87,6 +87,34 @@ SystemError [ERR_SYSTEM_ERROR]: uv_interface_addresses returned Unknown system e
   `kimi` 就废了。脚本会自动清理 `.zshrc`/`.bashrc`/`.profile` 里对应的行。
 - **别删 `LD_PRELOAD` 那行**：路径悬空的话，bionic 的子进程会跟着炸。
 
+## 从电脑访问手机上的 `kimi web`
+
+Android 不允许热点客户端连接手机上的普通应用（系统栈可以，普通 App 不行），
+所以电脑直接访问 `http://<手机热点IP>:58627/` 会超时。
+
+绕过办法是**反向隧道**：手机主动连电脑（这方向是通的），电脑在本地开一个端口，
+把流量经隧道送回手机。两个脚本：
+
+| 文件 | 跑在哪 | 作用 |
+|---|---|---|
+| `tunnel-server.py` | 电脑（需 Python） | 监听隧道端口，并在 `127.0.0.1:58628` 开一个入口端口 |
+| `tunnel-phone.py` | 手机（Termux） | 主动连电脑，把隧道流量转到手机的 `127.0.0.1:58627` |
+
+```sh
+# 电脑
+python tunnel-server.py
+# 手机（把 <电脑IP> 换成电脑在热点里的地址）
+python3 tunnel-phone.py <电脑IP>
+# 电脑浏览器
+#   http://127.0.0.1:58628/#token=<kimi web 横幅里的 token>
+```
+
+参数（两边通用）：`--host-port`（电脑入口，默认 58628）、`--tunnel-port`（默认 9000）、
+`--target-port`（手机上的目标端口，默认 58627）。
+
+> 电脑首次运行要允许防火墙放行隧道端口（9000），否则手机连不上。
+> 更省事的替代方案：直接 `adb reverse tcp:58627 tcp:58627`（需 USB 调试）。
+
 ## 环境要求
 
 - Termux（Android）
