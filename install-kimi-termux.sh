@@ -31,6 +31,7 @@ SHIM_SRC="$HOME/.local/share/nolink.c"
 SHIM_SO="$HOME/.local/lib/nolink.so"
 IFADDRRS_SRC="$HOME/.local/share/ifaddrs.c"
 IFADDRRS_SO="$HOME/.local/lib/ifaddrs.so"
+HIJACK_JS="$KIMI_HOME/hijack.js"
 
 DO_OFFICIAL=1
 DO_HARDLINK=1
@@ -574,6 +575,41 @@ else
 	rm -f "$IFADDRRS_SO"
 fi
 
+# ---------- 5b. hijack.js ----------
+# 给 os.networkInterfaces() 兜一层异常：Android 上它可能抛 EACCES，
+# 而 kimi web 在 'listening' 事件回调里调它，异常逃逸出去会带走整个进程。
+# 它只在真的抛错时才返回空对象，正常情况仍走 ifaddrs.so 的真实网卡列表。
+say "写入 $HIJACK_JS"
+if [ "$DO_DRYRUN" = 1 ]; then
+	printf '    %s\n' "写入 $HIJACK_JS"
+else
+	mkdir -p "$(dirname "$HIJACK_JS")"
+	cat > "$HIJACK_JS" <<'EOF'
+// os.networkInterfaces() 在 Android 上可能抛异常：
+// glibc 的 getifaddrs() 要 CAP_NET_ADMIN 才能做 NETLINK_ROUTE 汇总，
+// 而且还要读被封的 /proc/net/if_inet6，于是返回 EACCES，
+// Node 抛 "uv_interface_addresses returned Unknown system error 13"。
+// kimi web 在 'listening' 事件回调里调它，异常逃逸出去会直接带走整个进程。
+//
+// 这里不替换实现，只兜住异常：
+//   - 正常情况（配合 ~/.local/lib/ifaddrs.so 时）返回真实网卡列表；
+//   - 枚举失败时返回空对象，进程照常启动，只是横幅里没有 Network 行。
+//
+// 用法：NODE_OPTIONS="--require ~/.kimi-code/hijack.js" kimi web --host 0.0.0.0
+const os = require('os');
+
+const real = os.networkInterfaces;
+
+os.networkInterfaces = function networkInterfaces () {
+  try {
+    return real.call(os);
+  } catch {
+    return {};
+  }
+};
+EOF
+fi
+
 # ---------- 6. 启动器 ----------
 # 放到补丁之后：LD_PRELOAD 要按实际编出来的 .so 来定，
 # 路径悬空会让 bionic 的子进程（kimi 跑命令用的 /bin/sh）直接炸
@@ -600,6 +636,13 @@ else
 unset LD_LIBRARY_PATH LD_AUDIT
 GLIBC=$GLIBC_PREFIX
 EOF
+	if [ -f "$HIJACK_JS" ]; then
+		cat >> "$LAUNCHER" <<EOF
+# hijack.js：兜住 os.networkInterfaces() 的异常。它只在真的抛错时才返回空对象，
+# 正常情况仍走 ifaddrs.so 给出的真实网卡列表（横幅里的 Network 行）。
+export NODE_OPTIONS="--require $HIJACK_JS\${NODE_OPTIONS:+ \$NODE_OPTIONS}"
+EOF
+	fi
 	if [ -n "$PRELOAD" ]; then
 		printf 'export LD_PRELOAD=%s\n' "$PRELOAD" >> "$LAUNCHER"
 	fi
