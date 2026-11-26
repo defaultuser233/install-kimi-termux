@@ -255,6 +255,7 @@ if [ "$DO_IFADDRRS" = 1 ]; then
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -347,12 +348,32 @@ static void append_entry(struct ifaddrs **head, struct ifaddrs **tail,
     *tail = e;
 }
 
+/* 取接口的真实标志（IFF_*）。
+ * 注意不能用地址消息里的 IFA_FLAGS——那是 IFA_F_* 地址标志（0x80 之类），
+ * 不是接口标志。libuv 的 uv__ifaddr_exclude() 要求 ifa_flags 同时带
+ * IFF_UP 和 IFF_RUNNING，否则整条被丢掉，os.networkInterfaces() 就返回 {};
+ * is_internal 也是靠 IFF_LOOPBACK 判的。
+ * RTM_GETLINK 汇总在 Android 上被拒，所以这里用 ioctl(SIOCGIFFLAGS) 逐个问。 */
+static unsigned interface_flags(int sock, const char *name)
+{
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+    if (ioctl(sock, SIOCGIFFLAGS, &ifr) == 0)
+        return (unsigned)ifr.ifr_flags;
+    /* 兜底：拿不到就按"已启用"算，否则 libuv 会把这条丢掉 */
+    return IFF_UP | IFF_RUNNING;
+}
+
 /* 从 netlink 的地址表里取接口 */
 static int query_netlink(struct ifaddrs **head, struct ifaddrs **tail)
 {
     int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return -1;
+
+    /* 取接口标志用的 socket */
+    int ifsock = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 
     /* 和 bionic 一致：20 字节请求，payload 的 ifa_family 留 0(AF_UNSPEC) */
     unsigned char req[20];
@@ -444,6 +465,9 @@ static int query_netlink(struct ifaddrs **head, struct ifaddrs **tail)
             if (!name || !name[0])
                 continue;   /* IPv6 条目常常没有 IFA_LABEL，对不上名字就跳过 */
 
+            /* 接口标志要真实的 IFF_*，地址消息里的 IFA_FLAGS 是地址标志，用不了 */
+            flags = interface_flags(ifsock, name);
+
             struct sockaddr_storage sa;
             memset(&sa, 0, sizeof(sa));
             if (family == AF_INET && addrlen == 4) {
@@ -471,6 +495,8 @@ static int query_netlink(struct ifaddrs **head, struct ifaddrs **tail)
     }
 done:
     close(fd);
+    if (ifsock >= 0)
+        close(ifsock);
     return (*head ? 0 : -1);
 }
 
@@ -508,6 +534,21 @@ int getifaddrs(struct ifaddrs **ifap)
     }
 
     *ifap = head;
+    if (getenv("IFADDRRS_DEBUG") != NULL) {
+        int n = 0;
+        for (struct ifaddrs *e = head; e; e = e->ifa_next) {
+            char ip[64] = "?";
+            if (e->ifa_addr && e->ifa_addr->sa_family == AF_INET)
+                inet_ntop(AF_INET, &((struct sockaddr_in *)e->ifa_addr)->sin_addr, ip, sizeof(ip));
+            else if (e->ifa_addr && e->ifa_addr->sa_family == AF_INET6)
+                inet_ntop(AF_INET6, &((struct sockaddr_in6 *)e->ifa_addr)->sin6_addr, ip, sizeof(ip));
+            fprintf(stderr, "[ifaddrs] %-10s family=%d %s flags=0x%x\n",
+                    e->ifa_name ? e->ifa_name : "?", e->ifa_addr ? e->ifa_addr->sa_family : -1,
+                    ip, e->ifa_flags);
+            n++;
+        }
+        fprintf(stderr, "[ifaddrs] 共 %d 条\n", n);
+    }
     return 0;
 }
 
